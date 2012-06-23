@@ -1,9 +1,11 @@
 #include <v8.h>
 #include <node.h>
 #include <X11/Xlib.h>
+#include <X11/Xatom.h>
 #include <pthread.h>
 #include <ev.h>
 #include <string.h>
+#include <list>
 
 #include "jsdx_systray.hpp"
 
@@ -11,38 +13,69 @@
 #define SYSTEM_TRAY_BEGIN_MESSAGE   1
 #define SYSTEM_TRAY_CANCEL_MESSAGE  2
 
+#define SYSTEM_TRAY_ORIENTATION_HORZ 0
+#define SYSTEM_TRAY_ORIENTATION_VERT 1
+
 namespace JSDXSystray {
  
 	using namespace node;
 	using namespace v8;
+	using namespace std;
 
+	/* Events */
+	enum {
+		SYSTRAY_EVENT_ADD_CLIENT
+	};
+
+	/* Event handlers */
+	NodeCallback *add_client_cb = NULL;
+
+	/* X11 Atoms */
 	Atom a_NET_SYSTEM_TRAY_OPCODE;
 	Atom a_NET_SYSTEM_TRAY_MESSAGE_DATA;
 	Atom a_NET_SYSTEM_TRAY_REQUEST_DOCK;
 	Atom a_NET_SYSTEM_TRAY_BEGIN_MESSAGE;
 	Atom a_NET_SYSTEM_TRAY_CANCEL_MESSAGE;
+	Atom a_NET_SYSTEM_TRAY_ORIENTATION;
 
+	/* Thread for X11 event dispatcher */
 	static pthread_t x11event_thread;
 	static ev_async eio_x11event_notifier;
-
-	XEvent x11event;
 	pthread_mutex_t x11event_mutex = PTHREAD_MUTEX_INITIALIZER;
+	XEvent x11event;
 
-	static void *X11EventDispatcherThread(void *)
+	/* X11 systray */
+	Window trayWindow;
+	list<int> trayClients;
+
+	static void *X11EventDispatcherThread(void *d)
 	{
-		Display *disp = XOpenDisplay(NULL);
+		Display *disp = (Display *)d;
+		int fd = ConnectionNumber(disp);
+		struct timeval tv;
+		fd_set in_fds;
 
 		while(1) {
-			if (XPending(disp)) {
 
-				printf("12313123\n");
+			/* Create a File Description for X11 display */
+			FD_ZERO(&in_fds);
+			FD_SET(fd, &in_fds);
 
-				/* Got event */
-				pthread_mutex_lock(&x11event_mutex);
-				XNextEvent(disp, &x11event);
-				pthread_mutex_unlock(&x11event_mutex);
+			/* Set our timer */
+			tv.tv_usec = 0;
+			tv.tv_sec = 1;
 
-				ev_async_send(EV_DEFAULT_UC_ &eio_x11event_notifier);
+			/* Wait for X Event or a Timer */
+			if (select(fd + 1, &in_fds, 0, 0, &tv)) {
+
+				while(XPending(disp)) {
+
+					/* Got event */
+					pthread_mutex_lock(&x11event_mutex);
+					XNextEvent(disp, &x11event);
+					ev_async_send(EV_DEFAULT_UC_ &eio_x11event_notifier);
+					pthread_mutex_unlock(&x11event_mutex);
+				}
 			}
 		}
 	}
@@ -56,19 +89,39 @@ namespace JSDXSystray {
 
 		pthread_mutex_lock(&x11event_mutex);
 
-		if (x11event.type == ClientMessage) {
+		if (x11event.type == DestroyNotify) {
+			XDestroyWindowEvent *xewe = (XDestroyWindowEvent *)&x11event;
+
+			/* Remove client of tray */
+			trayClients.remove(xewe->window);
+
+		} else if (x11event.type == ClientMessage) {
 			if (x11event.xclient.message_type == a_NET_SYSTEM_TRAY_OPCODE) {
-				printf("_NET_SYSTEM_TRAY_OPCODE\n");
 
 				/* Dispatch on the request */
 				switch(x11event.xclient.data.l[1]) {
 				case SYSTEM_TRAY_REQUEST_DOCK:
 
+					if (x11event.xclient.window == trayWindow) {
+						/* Add to client list */
+						trayClients.push_back(x11event.xclient.data.l[2]);
+
+						/* Prepare arguments */
+						Local<Value> argv[1] = {
+							Local<Value>::New(Integer::New(x11event.xclient.data.l[2]))
+						};
+
+						/* Call callback function */
+						add_client_cb->cb->Call(add_client_cb->Holder, 1, argv);
+					}
+
 					break;
 				case SYSTEM_TRAY_BEGIN_MESSAGE:
+					printf("BEGIN_MESSAGE\n");
 
 					break;
 				case SYSTEM_TRAY_CANCEL_MESSAGE:
+					printf("CANCEL_MESSAGE\n");
 
 					break;
 				}
@@ -117,16 +170,22 @@ namespace JSDXSystray {
 
 		a_NET_SYSTEM_TRAY_OPCODE = XInternAtom(disp, "_NET_SYSTEM_TRAY_OPCODE", False);
 		a_NET_SYSTEM_TRAY_MESSAGE_DATA = XInternAtom(disp, "_NET_SYSTEM_TRAY_MESSAGE_DATA", False);
+		a_NET_SYSTEM_TRAY_ORIENTATION = XInternAtom(disp, "_NET_SYSTEM_TRAY_ORIENTATION", False);
+
+		/* Create thread */
+		pthread_create(&x11event_thread, NULL, X11EventDispatcherThread, (void *)disp);
 
 		/* Create an invisible window to manage selection */
-		Window w = XCreateWindow(disp, root,
+		trayWindow = XCreateWindow(disp, root,
 			0, 0,
 			-1, -1,
 			0, 0,
 			InputOnly, DefaultVisual(disp, 0), 0, NULL);
 
+		XSelectInput(disp, trayWindow, StructureNotifyMask | FocusChangeMask | PropertyChangeMask | ExposureMask);
+
 		/* Set selection owner */
-		XSetSelectionOwner(disp, xa_tray_selection, w, CurrentTime);
+		XSetSelectionOwner(disp, xa_tray_selection, trayWindow, CurrentTime);
 
 		/* Send X event to become an owner */
 		XClientMessageEvent xev;
@@ -136,10 +195,18 @@ namespace JSDXSystray {
 		xev.format = 32;
 		xev.data.l[0] = CurrentTime;
 		xev.data.l[1] = xa_tray_selection;
-		xev.data.l[2] = w;
+		xev.data.l[2] = trayWindow;
 		xev.data.l[3] = 0;
 		xev.data.l[4] = 0;
 		XSendEvent(disp, root, False, StructureNotifyMask, (XEvent *) &xev);
+
+		/* Set the orientation */
+		unsigned long data = SYSTEM_TRAY_ORIENTATION_HORZ;
+		XChangeProperty(disp, trayWindow,
+			a_NET_SYSTEM_TRAY_ORIENTATION,
+			XA_CARDINAL, 32,
+			PropModeReplace,
+			(unsigned char *) &data, 1);
 
 		/* start background thread and event handler for callback */
 		ev_async_init(&eio_x11event_notifier, X11EventCallback);
@@ -147,9 +214,47 @@ namespace JSDXSystray {
 
 		ev_ref(EV_DEFAULT_UC);
 
-		pthread_create(&x11event_thread, NULL, X11EventDispatcherThread, 0);
-
 		return scope.Close(Boolean::New(True));
+	}
+
+	static Handle<Value> X11GetTrayClients(const Arguments& args)
+	{
+		HandleScope scope;
+		list<int>::iterator it;
+		int i = 0;
+
+		/* Prepare JavaScript array */
+		Local<Array> arr = Array::New(trayClients.size()); 
+
+		for (it = trayClients.begin(); it != trayClients.end(); it++, i++) {
+			arr->Set(i, Integer::New(*it));
+		}
+
+		return scope.Close(arr);
+	}
+
+	static Handle<Value> SetEventHandler(const Arguments& args)
+	{
+		HandleScope scope;
+
+		if (args[0]->IsNumber() && args[1]->IsFunction()) {
+			switch(args[0]->ToInteger()->Value()) {
+			case SYSTRAY_EVENT_ADD_CLIENT:
+				if (add_client_cb) {
+					add_client_cb->Holder.Dispose();
+					add_client_cb->cb.Dispose();
+				} else {
+					add_client_cb = new NodeCallback();
+				}
+
+				/* Set function */
+				add_client_cb->Holder = Persistent<Object>::New(args.Holder());
+				add_client_cb->cb = Persistent<Function>::New(Handle<Function>::Cast(args[1]));
+				break;
+			}
+		}
+
+		return Undefined();
 	}
 
 	static void init(Handle<Object> target) {
@@ -157,6 +262,10 @@ namespace JSDXSystray {
 
 		NODE_SET_METHOD(target, "x11HasSelectionOwner", X11HasSelectionOwner);
 		NODE_SET_METHOD(target, "x11AcquireSelection", X11AcquireSelection);
+		NODE_SET_METHOD(target, "x11GetTrayClients", X11GetTrayClients);
+		NODE_SET_METHOD(target, "on", SetEventHandler);
+
+		JSDX_SYSTRAY_DEFINE_CONSTANT(target, "EVENT_ADD_CLIENT", SYSTRAY_EVENT_ADD_CLIENT);
 	}
 
 	NODE_MODULE(jsdx_systray, init);

@@ -19,7 +19,6 @@ namespace JSDXSystray {
 			cb.Dispose();
 		}
 	};
-
 }
 
 #endif
