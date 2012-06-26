@@ -19,6 +19,14 @@ namespace JSDXSystray {
 			cb.Dispose();
 		}
 	};
+
+	typedef struct {
+		long flags;
+		long functions;
+		long decorations;
+		long input_mode;
+		long state;
+	} MotifWmHints;
 }
 
 #endif

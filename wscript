@@ -25,9 +25,10 @@ def build(bld):
 	obj.target = "jsdx_systray"
 	obj.source = """
 		src/jsdx_systray.cpp
+		src/ewmh.cpp
 		"""
 	obj.cxxflags = ["-D_FILE_OFFSET_BITS=64", "-D_LARGEFILE_SOURCE"]
-	obj.uselib = "XRANDR"
+	obj.uselib = ""
 
 	if bld.env["WITH_X11"]:
 		obj.cxxflags.append("-DUSE_X11");

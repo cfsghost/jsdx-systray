@@ -8,6 +8,7 @@
 #include <list>
 
 #include "jsdx_systray.hpp"
+#include "ewmh.hpp"
 
 #define SYSTEM_TRAY_REQUEST_DOCK    0
 #define SYSTEM_TRAY_BEGIN_MESSAGE   1
@@ -21,6 +22,10 @@ namespace JSDXSystray {
 	using namespace node;
 	using namespace v8;
 	using namespace std;
+
+	/* Properties */
+	int icon_size_width = 32;
+	int icon_size_height = 32;
 
 	/* Events */
 	enum {
@@ -42,6 +47,7 @@ namespace JSDXSystray {
 	static pthread_t x11event_thread;
 	static ev_async eio_x11event_notifier;
 	pthread_mutex_t x11event_mutex = PTHREAD_MUTEX_INITIALIZER;
+	Display *display;
 	XEvent x11event;
 
 	/* X11 systray */
@@ -68,14 +74,14 @@ namespace JSDXSystray {
 			/* Wait for X Event or a Timer */
 			if (select(fd + 1, &in_fds, 0, 0, &tv)) {
 
-				while(XPending(disp)) {
+				pthread_mutex_lock(&x11event_mutex);
 
-					/* Got event */
-					pthread_mutex_lock(&x11event_mutex);
-					XNextEvent(disp, &x11event);
+				/* Call handler if there is events */
+				if (XPending(disp)) {
 					ev_async_send(EV_DEFAULT_UC_ &eio_x11event_notifier);
-					pthread_mutex_unlock(&x11event_mutex);
 				}
+
+				pthread_mutex_unlock(&x11event_mutex);
 			}
 		}
 	}
@@ -89,44 +95,56 @@ namespace JSDXSystray {
 
 		pthread_mutex_lock(&x11event_mutex);
 
-		if (x11event.type == DestroyNotify) {
-			XDestroyWindowEvent *xewe = (XDestroyWindowEvent *)&x11event;
+		/* Handle all events */
+		while(XPending(display)) {
+			XNextEvent(display, &x11event);
 
-			/* Remove client of tray */
-			trayClients.remove(xewe->window);
+			if (x11event.type == DestroyNotify) {
+				XDestroyWindowEvent *xewe = (XDestroyWindowEvent *)&x11event;
 
-		} else if (x11event.type == ClientMessage) {
-			if (x11event.xclient.message_type == a_NET_SYSTEM_TRAY_OPCODE) {
+				/* Remove client of tray */
+				trayClients.remove(xewe->window);
 
-				/* Dispatch on the request */
-				switch(x11event.xclient.data.l[1]) {
-				case SYSTEM_TRAY_REQUEST_DOCK:
+			} else if (x11event.type == ClientMessage) {
+				if (x11event.xclient.message_type == a_NET_SYSTEM_TRAY_OPCODE) {
 
-					if (x11event.xclient.window == trayWindow) {
-						/* Add to client list */
-						trayClients.push_back(x11event.xclient.data.l[2]);
+					/* Dispatch on the request */
+					switch(x11event.xclient.data.l[1]) {
+					case SYSTEM_TRAY_REQUEST_DOCK:
 
-						/* Prepare arguments */
-						Local<Value> argv[1] = {
-							Local<Value>::New(Integer::New(x11event.xclient.data.l[2]))
-						};
+						if (x11event.xclient.window == trayWindow) {
 
-						/* Call callback function */
-						add_client_cb->cb->Call(add_client_cb->Holder, 1, argv);
+							/* Add to client list */
+							trayClients.push_back(x11event.xclient.data.l[2]);
+
+							/* Fixed window size, because Qt application is so stupid. */
+							XResizeWindow(display, x11event.xclient.data.l[2], icon_size_width, icon_size_height);
+							XReparentWindow(display, x11event.xclient.data.l[2], trayWindow, 0, 0);
+
+							XMapWindow(display, x11event.xclient.data.l[2]);
+
+							/* Prepare arguments */
+							Local<Value> argv[1] = {
+								Local<Value>::New(Integer::New(x11event.xclient.data.l[2]))
+							};
+
+							/* Call callback function */
+							add_client_cb->cb->Call(add_client_cb->Holder, 1, argv);
+						}
+
+						break;
+					case SYSTEM_TRAY_BEGIN_MESSAGE:
+						printf("BEGIN_MESSAGE\n");
+
+						break;
+					case SYSTEM_TRAY_CANCEL_MESSAGE:
+						printf("CANCEL_MESSAGE\n");
+
+						break;
 					}
-
-					break;
-				case SYSTEM_TRAY_BEGIN_MESSAGE:
-					printf("BEGIN_MESSAGE\n");
-
-					break;
-				case SYSTEM_TRAY_CANCEL_MESSAGE:
-					printf("CANCEL_MESSAGE\n");
-
-					break;
+				} else if (x11event.xclient.message_type == a_NET_SYSTEM_TRAY_MESSAGE_DATA) {
+					printf("_NET_SYSTEM_TRAY_MESSAGE_DATA\n");
 				}
-			} else if (x11event.xclient.message_type == a_NET_SYSTEM_TRAY_MESSAGE_DATA) {
-				printf("_NET_SYSTEM_TRAY_MESSAGE_DATA\n");
 			}
 		}
 
@@ -159,7 +177,7 @@ namespace JSDXSystray {
 		HandleScope scope;
 
 		/* Get current display, screen and root window */
-		Display *disp = XOpenDisplay(NULL);
+		Display *disp = display = XOpenDisplay(NULL);
 		int screen = DefaultScreen(disp);
 		Window root = DefaultRootWindow(disp);
 
@@ -176,13 +194,61 @@ namespace JSDXSystray {
 		pthread_create(&x11event_thread, NULL, X11EventDispatcherThread, (void *)disp);
 
 		/* Create an invisible window to manage selection */
+/*
 		trayWindow = XCreateWindow(disp, root,
 			0, 0,
 			-1, -1,
 			0, 0,
 			InputOnly, DefaultVisual(disp, 0), 0, NULL);
+*/
+		trayWindow = XCreateSimpleWindow(disp, root,
+			0, 0, 1, 1,
+			0, 0, 0);
 
 		XSelectInput(disp, trayWindow, StructureNotifyMask | FocusChangeMask | PropertyChangeMask | ExposureMask);
+
+		/* Set tray window states */
+		EWMH::setWindowState(disp, trayWindow, "_NET_WM_STATE_STICKY");
+		EWMH::setWindowState(disp, trayWindow, "_NET_WM_STATE_SKIP_TASKBAR");
+		EWMH::setWindowState(disp, trayWindow, "_NET_WM_STATE_SKIP_PAGER");
+
+		/* Take off tray window decorator */
+		MotifWmHints new_hints;
+		MotifWmHints *hints;
+		Atom hints_atom = XInternAtom(display, "_MOTIF_WM_HINTS", False);
+		int format;
+		Atom type;
+		unsigned long nitems;
+		unsigned long bytes_after;
+		unsigned char *hints_data;
+
+		XGetWindowProperty(display, trayWindow,
+			hints_atom, 0, sizeof(MotifWmHints) / sizeof(long),
+			False, AnyPropertyType, &type, &format, &nitems,
+			&bytes_after, &hints_data);
+		if (type == None) {
+			new_hints.flags = (1L << 1);
+			new_hints.decorations = 0L;
+			hints = &new_hints;
+		} else {
+			hints = (MotifWmHints *)hints_data;
+			hints->flags |= (1L << 1);
+			hints->decorations = 0L;
+		}
+
+		XGrabServer(display);
+
+		XChangeProperty(display, trayWindow, hints_atom,
+			hints_atom, 32, PropModeReplace,
+			(unsigned char *)hints, sizeof(MotifWmHints) / sizeof(long));
+
+		if (hints != &new_hints)
+			XFree(hints);
+
+		XUngrabServer(display);
+
+		/* Show */
+		XMapWindow(disp, trayWindow);
 
 		/* Set selection owner */
 		XSetSelectionOwner(disp, xa_tray_selection, trayWindow, CurrentTime);
