@@ -27,6 +27,9 @@ namespace JSDXSystray {
 		long input_mode;
 		long state;
 	} MotifWmHints;
+
+	static v8::Handle<v8::Value> X11GetTrayClients(const v8::Arguments& args);
+	static bool X11TrayClientExists(Window w);
 }
 
 #endif

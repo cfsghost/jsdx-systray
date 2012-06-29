@@ -9,6 +9,7 @@
 
 #include "jsdx_systray.hpp"
 #include "ewmh.hpp"
+#include "xembed.hpp"
 
 #define SYSTEM_TRAY_REQUEST_DOCK    0
 #define SYSTEM_TRAY_BEGIN_MESSAGE   1
@@ -29,11 +30,22 @@ namespace JSDXSystray {
 
 	/* Events */
 	enum {
-		SYSTRAY_EVENT_ADD_CLIENT
+		SYSTRAY_EVENT_ADD_CLIENT,
+		SYSTRAY_EVENT_REMOVE_CLIENT,
+		SYSTRAY_EVENT_MAP_CLIENT,
+		SYSTRAY_EVENT_UNMAP_CLIENT
+	};
+
+	enum {
+		SYSTRAY_EVENT_BUTTON_PRESS,
+		SYSTRAY_EVENT_BUTTON_RELEASE
 	};
 
 	/* Event handlers */
 	NodeCallback *add_client_cb = NULL;
+	NodeCallback *remove_client_cb = NULL;
+	NodeCallback *map_client_cb = NULL;
+	NodeCallback *unmap_client_cb = NULL;
 
 	/* X11 Atoms */
 	Atom a_NET_SYSTEM_TRAY_OPCODE;
@@ -42,11 +54,15 @@ namespace JSDXSystray {
 	Atom a_NET_SYSTEM_TRAY_BEGIN_MESSAGE;
 	Atom a_NET_SYSTEM_TRAY_CANCEL_MESSAGE;
 	Atom a_NET_SYSTEM_TRAY_ORIENTATION;
+	Atom a_NET_ACTIVE_WINDOW;
+	Atom a_WM_PROTOCOLS;
+	Atom a_WM_TAKE_FOCUS;
 
 	/* Thread for X11 event dispatcher */
 	static pthread_t x11event_thread;
 	static ev_async eio_x11event_notifier;
 	pthread_mutex_t x11event_mutex = PTHREAD_MUTEX_INITIALIZER;
+	bool thread_running = False;
 	Display *display;
 	XEvent x11event;
 
@@ -61,7 +77,9 @@ namespace JSDXSystray {
 		struct timeval tv;
 		fd_set in_fds;
 
-		while(1) {
+		thread_running = True;
+
+		while(thread_running) {
 
 			/* Create a File Description for X11 display */
 			FD_ZERO(&in_fds);
@@ -74,9 +92,8 @@ namespace JSDXSystray {
 			/* Wait for X Event or a Timer */
 			if (select(fd + 1, &in_fds, 0, 0, &tv)) {
 
-				pthread_mutex_lock(&x11event_mutex);
-
 				/* Call handler if there is events */
+				pthread_mutex_lock(&x11event_mutex);
 				if (XPending(disp)) {
 					ev_async_send(EV_DEFAULT_UC_ &eio_x11event_notifier);
 				}
@@ -102,54 +119,136 @@ namespace JSDXSystray {
 			if (x11event.type == DestroyNotify) {
 				XDestroyWindowEvent *xewe = (XDestroyWindowEvent *)&x11event;
 
-				/* Remove client of tray */
-				trayClients.remove(xewe->window);
+				if (X11TrayClientExists(xewe->window)) {
+					if (remove_client_cb) {
+						/* Prepare arguments */
+						Local<Value> argv[1] = {
+							Local<Value>::New(Integer::New(xewe->window))
+						};
+
+						/* Call callback function */
+						remove_client_cb->cb->Call(remove_client_cb->Holder, 1, argv);
+					}
+
+					/* Remove client of tray */
+					trayClients.remove(xewe->window);
+				}
 
 			} else if (x11event.type == ClientMessage) {
-				if (x11event.xclient.message_type == a_NET_SYSTEM_TRAY_OPCODE) {
+				if (x11event.xclient.window == trayWindow) {
+					if (!XEMBED::eventHandler(&x11event))
+						continue;
 
-					/* Dispatch on the request */
-					switch(x11event.xclient.data.l[1]) {
-					case SYSTEM_TRAY_REQUEST_DOCK:
+					if (x11event.xclient.message_type == a_NET_SYSTEM_TRAY_OPCODE) {
 
-						if (x11event.xclient.window == trayWindow) {
+						/* Dispatch on the request */
+						switch(x11event.xclient.data.l[1]) {
+						case SYSTEM_TRAY_REQUEST_DOCK: {
+							Window clientWin = x11event.xclient.data.l[2];
+							bool support_xembed = XEMBED::isSupported(display, clientWin);
+
+							/* If client exists already, ignore this event. */
+							if (X11TrayClientExists(clientWin))
+								break;
+
+							/* Ping the window and get its state */
+							XWindowAttributes xwa;
+							if (!XGetWindowAttributes(display, clientWin, &xwa))
+								break;
 
 							/* Add to client list */
-							trayClients.push_back(x11event.xclient.data.l[2]);
+							trayClients.push_back(clientWin);
+
+							/* Append client window on tray window */
+							XUnmapWindow(display, clientWin);
+
+							XReparentWindow(display, clientWin, trayWindow, 0, 0);
+							XSelectInput(display, clientWin, StructureNotifyMask | PropertyChangeMask);
 
 							/* Fixed window size, because Qt application is so stupid. */
-							XResizeWindow(display, x11event.xclient.data.l[2], icon_size_width, icon_size_height);
-							XReparentWindow(display, x11event.xclient.data.l[2], trayWindow, 0, 0);
+							XResizeWindow(display, clientWin, icon_size_width, icon_size_height);
 
-							XMapWindow(display, x11event.xclient.data.l[2]);
+							/* XEMBED */
+							if (support_xembed) {
+								XEMBED::sendEmbeddedNotify(display, clientWin, trayWindow);
+								XEMBED::setWindowActivate(display, clientWin);
+								XEMBED::setFocusIn(display, clientWin);
 
-							/* Prepare arguments */
-							Local<Value> argv[1] = {
-								Local<Value>::New(Integer::New(x11event.xclient.data.l[2]))
-							};
+								if (XEMBED::getMappedState(display, clientWin)) {
+									XMapRaised(display, clientWin);
+								}
+							} else {
+								XMapRaised(display, clientWin);
+							}
 
-							/* Call callback function */
-							add_client_cb->cb->Call(add_client_cb->Holder, 1, argv);
+							if (add_client_cb) {
+								/* Prepare arguments */
+								Local<Value> argv[1] = {
+									Local<Value>::New(Integer::New(clientWin))
+								};
+
+								/* Call callback function */
+								add_client_cb->cb->Call(add_client_cb->Holder, 1, argv);
+							}
+							break;
+						}
+						case SYSTEM_TRAY_BEGIN_MESSAGE:
+							printf("BEGIN_MESSAGE\n");
+
+							break;
+						case SYSTEM_TRAY_CANCEL_MESSAGE:
+							printf("CANCEL_MESSAGE\n");
+
+							break;
 						}
 
-						break;
-					case SYSTEM_TRAY_BEGIN_MESSAGE:
-						printf("BEGIN_MESSAGE\n");
-
-						break;
-					case SYSTEM_TRAY_CANCEL_MESSAGE:
-						printf("CANCEL_MESSAGE\n");
-
-						break;
+					} else if (x11event.xclient.message_type == a_NET_SYSTEM_TRAY_MESSAGE_DATA) {
+						printf("_NET_SYSTEM_TRAY_MESSAGE_DATA\n");
+					} else if (x11event.xclient.message_type == a_WM_PROTOCOLS && x11event.xclient.data.l[0] == a_WM_TAKE_FOCUS) {
+						/* TODO: Take focus */
 					}
-				} else if (x11event.xclient.message_type == a_NET_SYSTEM_TRAY_MESSAGE_DATA) {
-					printf("_NET_SYSTEM_TRAY_MESSAGE_DATA\n");
+				}
+			} else if (x11event.type == PropertyNotify) {
+
+				if (X11TrayClientExists(x11event.xproperty.window)) {
+
+					if (!XEMBED::propertyNotifyHandler(&x11event))
+						continue;
+				}
+
+			} else if (x11event.type == MapNotify) {
+
+				if (X11TrayClientExists(x11event.xmap.window)) {
+
+					if (map_client_cb) {
+						/* Prepare arguments */
+						Local<Value> argv[1] = {
+							Local<Value>::New(Integer::New(x11event.xmap.window))
+						};
+
+						/* Call callback function */
+						map_client_cb->cb->Call(map_client_cb->Holder, 1, argv);
+					}
+				}
+
+			} else if (x11event.type == UnmapNotify) {
+
+				if (X11TrayClientExists(x11event.xunmap.window)) {
+
+					if (unmap_client_cb) {
+						/* Prepare arguments */
+						Local<Value> argv[1] = {
+							Local<Value>::New(Integer::New(x11event.xunmap.window))
+						};
+
+						/* Call callback function */
+						unmap_client_cb->cb->Call(unmap_client_cb->Holder, 1, argv);
+					}
 				}
 			}
 		}
 
 		pthread_mutex_unlock(&x11event_mutex);
-
 	}
 
 	static Handle<Value> X11HasSelectionOwner(const Arguments& args)
@@ -181,7 +280,7 @@ namespace JSDXSystray {
 		int screen = DefaultScreen(disp);
 		Window root = DefaultRootWindow(disp);
 
-		/* Get Atom */
+		/* Get Atom which relates to systray */
 		char selection_name[32];
 		sprintf(selection_name, "_NET_SYSTEM_TRAY_S%d", screen);
 		Atom xa_tray_selection = XInternAtom(disp, selection_name, False);
@@ -189,6 +288,11 @@ namespace JSDXSystray {
 		a_NET_SYSTEM_TRAY_OPCODE = XInternAtom(disp, "_NET_SYSTEM_TRAY_OPCODE", False);
 		a_NET_SYSTEM_TRAY_MESSAGE_DATA = XInternAtom(disp, "_NET_SYSTEM_TRAY_MESSAGE_DATA", False);
 		a_NET_SYSTEM_TRAY_ORIENTATION = XInternAtom(disp, "_NET_SYSTEM_TRAY_ORIENTATION", False);
+
+		/* Other X11 Atoms */
+		a_NET_ACTIVE_WINDOW = XInternAtom(disp, "_NET_ACTIVE_WINDOW", False);
+		a_WM_PROTOCOLS = XInternAtom(disp, "WM_PROTOCOLS", False);
+		a_WM_TAKE_FOCUS = XInternAtom(disp, "WM_TAKE_FOCUS", False);
 
 		/* Create thread */
 		pthread_create(&x11event_thread, NULL, X11EventDispatcherThread, (void *)disp);
@@ -202,10 +306,10 @@ namespace JSDXSystray {
 			InputOnly, DefaultVisual(disp, 0), 0, NULL);
 */
 		trayWindow = XCreateSimpleWindow(disp, root,
-			0, 0, 1, 1,
+			0, 0, 320, 320,
 			0, 0, 0);
 
-		XSelectInput(disp, trayWindow, StructureNotifyMask | FocusChangeMask | PropertyChangeMask | ExposureMask);
+		XSelectInput(disp, trayWindow, StructureNotifyMask | PropertyChangeMask);
 
 		/* Set tray window states */
 		EWMH::setWindowState(disp, trayWindow, "_NET_WM_STATE_STICKY");
@@ -249,11 +353,16 @@ namespace JSDXSystray {
 
 		/* Show */
 		XMapWindow(disp, trayWindow);
+		XLowerWindow(disp, trayWindow);
+
+		/* start background thread and event handler for callback */
+		ev_async_init(&eio_x11event_notifier, X11EventCallback);
+		ev_async_start(EV_DEFAULT_UC_ &eio_x11event_notifier);
 
 		/* Set selection owner */
 		XSetSelectionOwner(disp, xa_tray_selection, trayWindow, CurrentTime);
 
-		/* Send X event to become an owner */
+		/* Send X event to become selection owner */
 		XClientMessageEvent xev;
 		xev.type = ClientMessage;
 		xev.window = root;
@@ -273,10 +382,6 @@ namespace JSDXSystray {
 			XA_CARDINAL, 32,
 			PropModeReplace,
 			(unsigned char *) &data, 1);
-
-		/* start background thread and event handler for callback */
-		ev_async_init(&eio_x11event_notifier, X11EventCallback);
-		ev_async_start(EV_DEFAULT_UC_ &eio_x11event_notifier);
 
 		ev_ref(EV_DEFAULT_UC);
 
@@ -299,6 +404,19 @@ namespace JSDXSystray {
 		return scope.Close(arr);
 	}
 
+	static bool X11TrayClientExists(Window w)
+	{
+		HandleScope scope;
+		list<int>::iterator it;
+
+		for (it = trayClients.begin(); it != trayClients.end(); it++) {
+			if (w == *it)
+				return True;
+		}
+
+		return False;
+	}
+
 	static Handle<Value> SetEventHandler(const Arguments& args)
 	{
 		HandleScope scope;
@@ -317,6 +435,112 @@ namespace JSDXSystray {
 				add_client_cb->Holder = Persistent<Object>::New(args.Holder());
 				add_client_cb->cb = Persistent<Function>::New(Handle<Function>::Cast(args[1]));
 				break;
+
+			case SYSTRAY_EVENT_REMOVE_CLIENT:
+				if (remove_client_cb) {
+					remove_client_cb->Holder.Dispose();
+					remove_client_cb->cb.Dispose();
+				} else {
+					remove_client_cb = new NodeCallback();
+				}
+
+				/* Set function */
+				remove_client_cb->Holder = Persistent<Object>::New(args.Holder());
+				remove_client_cb->cb = Persistent<Function>::New(Handle<Function>::Cast(args[1]));
+				break;
+
+			case SYSTRAY_EVENT_MAP_CLIENT:
+				if (map_client_cb) {
+					map_client_cb->Holder.Dispose();
+					map_client_cb->cb.Dispose();
+				} else {
+					map_client_cb = new NodeCallback();
+				}
+
+				/* Set function */
+				map_client_cb->Holder = Persistent<Object>::New(args.Holder());
+				map_client_cb->cb = Persistent<Function>::New(Handle<Function>::Cast(args[1]));
+				break;
+
+			case SYSTRAY_EVENT_UNMAP_CLIENT:
+				if (unmap_client_cb) {
+					unmap_client_cb->Holder.Dispose();
+					unmap_client_cb->cb.Dispose();
+				} else {
+					unmap_client_cb = new NodeCallback();
+				}
+
+				/* Set function */
+				unmap_client_cb->Holder = Persistent<Object>::New(args.Holder());
+				unmap_client_cb->cb = Persistent<Function>::New(Handle<Function>::Cast(args[1]));
+				break;
+			}
+		}
+
+		return Undefined();
+	}
+
+	static Handle<Value> X11SendEvent(const Arguments& args)
+	{
+		HandleScope scope;
+
+		if (args[0]->IsNumber() && args[1]->IsNumber() && args[2]->IsObject()) {
+
+			Window w = args[0]->ToNumber()->Value();
+			int eventType = args[1]->ToInteger()->Value();
+
+			if (eventType == SYSTRAY_EVENT_BUTTON_PRESS || eventType == SYSTRAY_EVENT_BUTTON_RELEASE) {
+				XButtonEvent xev;
+
+				xev.display = display;
+				xev.time = CurrentTime;
+				xev.same_screen = True;
+				xev.type = (eventType == SYSTRAY_EVENT_BUTTON_PRESS) ? ButtonPress : ButtonRelease;
+
+				xev.x = args[2]->ToObject()->Get(String::NewSymbol("x"))->ToInteger()->Value();
+				xev.y = args[2]->ToObject()->Get(String::NewSymbol("y"))->ToInteger()->Value();
+
+				/* Getting top of window */
+				xev.subwindow = args[0]->ToNumber()->Value();
+				while(xev.subwindow) {
+					xev.window = xev.subwindow;
+
+					XQueryPointer(display, xev.window, &xev.root, &xev.subwindow, &xev.x_root, &xev.y_root, &xev.x, &xev.y, &xev.state);
+				}
+
+#if 0
+			/* Set focus on window */
+			int screen = DefaultScreen(display);
+			Window root = DefaultRootWindow(display);
+
+			EWMH::sendClientMsg32(display, root, xev.window, a_NET_ACTIVE_WINDOW, 1, CurrentTime, 0, 0, 0);
+//			EWMH::sendClientMsg32(display, root, trayWindow, a_WM_PROTOCOLS, a_WM_TAKE_FOCUS, 0, 0, 0, 0);
+/*
+			XChangeProperty(display, trayWindow,
+				a_NET_ACTIVE_WINDOW, XA_WINDOW, 32, PropModeReplace,
+				(unsigned char *)&xev.window, 1);
+*/
+			XFlush(display);
+#endif
+
+				/* Get button which was triggered */
+				int button = args[2]->ToObject()->Get(String::NewSymbol("button"))->ToInteger()->Value();
+				switch(button) {
+				case 1:
+					xev.state = Button1Mask;
+					xev.button = Button1;
+					break;
+				case 2:
+					xev.state = Button2Mask;
+					xev.button = Button2;
+					break;
+				default:
+					xev.state = Button3Mask;
+					xev.button = Button3;
+				}
+
+				XSendEvent(display, xev.window, True, SubstructureNotifyMask | ButtonPressMask, (XEvent *) &xev);
+				XFlush(display);
 			}
 		}
 
@@ -329,9 +553,16 @@ namespace JSDXSystray {
 		NODE_SET_METHOD(target, "x11HasSelectionOwner", X11HasSelectionOwner);
 		NODE_SET_METHOD(target, "x11AcquireSelection", X11AcquireSelection);
 		NODE_SET_METHOD(target, "x11GetTrayClients", X11GetTrayClients);
+		NODE_SET_METHOD(target, "x11SendEvent", X11SendEvent);
 		NODE_SET_METHOD(target, "on", SetEventHandler);
 
 		JSDX_SYSTRAY_DEFINE_CONSTANT(target, "EVENT_ADD_CLIENT", SYSTRAY_EVENT_ADD_CLIENT);
+		JSDX_SYSTRAY_DEFINE_CONSTANT(target, "EVENT_REMOVE_CLIENT", SYSTRAY_EVENT_REMOVE_CLIENT);
+		JSDX_SYSTRAY_DEFINE_CONSTANT(target, "EVENT_MAP_CLIENT", SYSTRAY_EVENT_MAP_CLIENT);
+		JSDX_SYSTRAY_DEFINE_CONSTANT(target, "EVENT_UNMAP_CLIENT", SYSTRAY_EVENT_UNMAP_CLIENT);
+
+		JSDX_SYSTRAY_DEFINE_CONSTANT(target, "EVENT_BUTTON_PRESS", SYSTRAY_EVENT_BUTTON_PRESS);
+		JSDX_SYSTRAY_DEFINE_CONSTANT(target, "EVENT_BUTTON_RELEASE", SYSTRAY_EVENT_BUTTON_RELEASE);
 	}
 
 	NODE_MODULE(jsdx_systray, init);

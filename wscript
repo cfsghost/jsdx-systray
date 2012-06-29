@@ -26,6 +26,7 @@ def build(bld):
 	obj.source = """
 		src/jsdx_systray.cpp
 		src/ewmh.cpp
+		src/xembed.cpp
 		"""
 	obj.cxxflags = ["-D_FILE_OFFSET_BITS=64", "-D_LARGEFILE_SOURCE"]
 	obj.uselib = ""
