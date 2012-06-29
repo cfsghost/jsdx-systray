@@ -306,7 +306,7 @@ namespace JSDXSystray {
 			InputOnly, DefaultVisual(disp, 0), 0, NULL);
 */
 		trayWindow = XCreateSimpleWindow(disp, root,
-			0, 0, 320, 320,
+			0, 0, 1, 1,
 			0, 0, 0);
 
 		XSelectInput(disp, trayWindow, StructureNotifyMask | PropertyChangeMask);
