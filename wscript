@@ -18,6 +18,7 @@ def configure(conf):
 		print "Enable X11 backend support"
 		conf.env["WITH_X11"] = True
 		conf.check_cfg(package='x11', uselib_store='X11', args='--cflags --libs')
+		conf.check_cfg(package='xrender', uselib_store='XRENDER', args='--cflags --libs')
 
 def build(bld):
 	obj = bld.new_task_gen("cxx", "shlib", "node_addon")
@@ -34,7 +35,7 @@ def build(bld):
 	if bld.env["WITH_X11"]:
 		obj.cxxflags.append("-DUSE_X11");
 
-		obj.uselib += " X11"
+		obj.uselib += " X11 XRENDER"
 
 def shutdown():
 	if Options.commands['clean']:

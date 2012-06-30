@@ -1,5 +1,6 @@
 #include <v8.h>
 #include <node.h>
+#include <X11/extensions/Xrender.h>
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
 #include <pthread.h>
@@ -54,6 +55,7 @@ namespace JSDXSystray {
 	Atom a_NET_SYSTEM_TRAY_BEGIN_MESSAGE;
 	Atom a_NET_SYSTEM_TRAY_CANCEL_MESSAGE;
 	Atom a_NET_SYSTEM_TRAY_ORIENTATION;
+	Atom a_NET_SYSTEM_TRAY_VISUAL;
 	Atom a_NET_ACTIVE_WINDOW;
 	Atom a_WM_PROTOCOLS;
 	Atom a_WM_TAKE_FOCUS;
@@ -67,6 +69,7 @@ namespace JSDXSystray {
 	XEvent x11event;
 
 	/* X11 systray */
+	Colormap colormap;
 	Window trayWindow;
 	list<int> trayClients;
 
@@ -162,11 +165,28 @@ namespace JSDXSystray {
 							/* Append client window on tray window */
 							XUnmapWindow(display, clientWin);
 
-							XReparentWindow(display, clientWin, trayWindow, 0, 0);
-							XSelectInput(display, clientWin, StructureNotifyMask | PropertyChangeMask);
-
 							/* Fixed window size, because Qt application is so stupid. */
 							XResizeWindow(display, clientWin, icon_size_width, icon_size_height);
+/*
+							XSetWindowAttributes attrs;
+							attrs.background_pixel = 0;
+							attrs.border_pixel = 0;
+							attrs.colormap = colormap;
+*/
+//							attrs.background_pixmap = None;
+//							XChangeWindowAttributes(display, clientWin, CWBackPixmap, &attrs);
+							XSetWindowBackground(display, clientWin, 0);
+//							XChangeWindowAttributes(display, clientWin, CWBackPixel | CWBorderPixel | CWColormap, &attrs);
+//							XChangeWindowAttributes(display, clientWin, CWBackPixel | CWBorderPixel, &attrs);
+
+//							XSetWindowBackground(display, clientWin, 0x00606060);
+//							XSetWindowBackgroundPixmap(display, clientWin, ParentRelative);
+
+							XReparentWindow(display, clientWin, trayWindow, 0, 0);
+							XSync(display, False);
+//							XSetWindowColormap(display, clientWin, colormap);
+
+							XSelectInput(display, clientWin, StructureNotifyMask | PropertyChangeMask);
 
 							/* XEMBED */
 							if (support_xembed) {
@@ -282,7 +302,35 @@ namespace JSDXSystray {
 		Display *disp = display = XOpenDisplay(NULL);
 		int screen = DefaultScreen(disp);
 		Window root = DefaultRootWindow(disp);
+#if 1
+		/* Support ARGB visual */
+		int eventBase, errorBase;
+		Visual *visual = DefaultVisual(disp, 0);
 
+		if (XRenderQueryExtension(disp, &eventBase, &errorBase)) {
+			int i;
+			int nvi;
+			XVisualInfo xvi_tpl;
+			xvi_tpl.screen = screen;
+			xvi_tpl.depth = 32;
+			xvi_tpl.c_class = TrueColor;
+
+			XVisualInfo *xvi = XGetVisualInfo(disp, VisualScreenMask | VisualDepthMask | VisualClassMask, &xvi_tpl, &nvi);
+
+			/* Set ARGB Mask */
+			for (i = 0; i < nvi; ++i) {
+				XRenderPictFormat *format = XRenderFindVisualFormat(disp, xvi[i].visual);
+
+				if (format->type == PictTypeDirect && format->direct.alphaMask) {
+					visual = xvi[i].visual;
+
+					break;
+				}
+			}
+
+			XFree(xvi);
+		}
+#endif
 		/* Get Atom which relates to systray */
 		char selection_name[32];
 		sprintf(selection_name, "_NET_SYSTEM_TRAY_S%d", screen);
@@ -291,6 +339,7 @@ namespace JSDXSystray {
 		a_NET_SYSTEM_TRAY_OPCODE = XInternAtom(disp, "_NET_SYSTEM_TRAY_OPCODE", False);
 		a_NET_SYSTEM_TRAY_MESSAGE_DATA = XInternAtom(disp, "_NET_SYSTEM_TRAY_MESSAGE_DATA", False);
 		a_NET_SYSTEM_TRAY_ORIENTATION = XInternAtom(disp, "_NET_SYSTEM_TRAY_ORIENTATION", False);
+		a_NET_SYSTEM_TRAY_VISUAL = XInternAtom(disp, "_NET_SYSTEM_TRAY_VISUAL", False);
 
 		/* Other X11 Atoms */
 		a_NET_ACTIVE_WINDOW = XInternAtom(disp, "_NET_ACTIVE_WINDOW", False);
@@ -299,8 +348,13 @@ namespace JSDXSystray {
 
 		/* Create thread */
 		pthread_create(&x11event_thread, NULL, X11EventDispatcherThread, (void *)disp);
-
+#if 1
 		/* Create an invisible window to manage selection */
+		XSetWindowAttributes attrs;
+		attrs.background_pixel = 0;
+		attrs.border_pixel = 0;
+		colormap = attrs.colormap = XCreateColormap(disp, root, visual, AllocNone);
+#endif
 /*
 		trayWindow = XCreateWindow(disp, root,
 			0, 0,
@@ -308,10 +362,20 @@ namespace JSDXSystray {
 			0, 0,
 			InputOnly, DefaultVisual(disp, 0), 0, NULL);
 */
+#if 0
+		trayWindow = XCreateWindow(disp, root,
+			0, 0,
+			320, 320,
+			0, 32,
+			InputOutput, visual, CWBackPixel | CWBorderPixel | CWColormap, &attrs);
+#endif
+#if 1
 		trayWindow = XCreateSimpleWindow(disp, root,
 			0, 0, 1, 1,
 			0, 0, 0);
-
+#endif
+//		XSetWindowBackgroundPixmap(display, trayWindow, 0);
+//		XSetWindowBackground(display, trayWindow, 0);
 		XSelectInput(disp, trayWindow, StructureNotifyMask | PropertyChangeMask);
 
 		/* Set tray window states */
@@ -362,6 +426,22 @@ namespace JSDXSystray {
 		ev_async_init(&eio_x11event_notifier, X11EventCallback);
 		ev_async_start(EV_DEFAULT_UC_ &eio_x11event_notifier);
 
+		/* Set the orientation */
+		unsigned long data = SYSTEM_TRAY_ORIENTATION_HORZ;
+		XChangeProperty(disp, trayWindow,
+			a_NET_SYSTEM_TRAY_ORIENTATION,
+			XA_CARDINAL, 32,
+			PropModeReplace,
+			(unsigned char *) &data, 1);
+
+		/* Set the visual */
+		VisualID visualID = XVisualIDFromVisual(visual);
+		XChangeProperty(disp, trayWindow,
+			a_NET_SYSTEM_TRAY_VISUAL,
+			XA_CARDINAL, 32,
+			PropModeReplace,
+			(unsigned char *) &visualID, 1);
+
 		/* Set selection owner */
 		XSetSelectionOwner(disp, xa_tray_selection, trayWindow, CurrentTime);
 
@@ -378,13 +458,6 @@ namespace JSDXSystray {
 		xev.data.l[4] = 0;
 		XSendEvent(disp, root, False, StructureNotifyMask, (XEvent *) &xev);
 
-		/* Set the orientation */
-		unsigned long data = SYSTEM_TRAY_ORIENTATION_HORZ;
-		XChangeProperty(disp, trayWindow,
-			a_NET_SYSTEM_TRAY_ORIENTATION,
-			XA_CARDINAL, 32,
-			PropModeReplace,
-			(unsigned char *) &data, 1);
 
 		ev_ref(EV_DEFAULT_UC);
 
