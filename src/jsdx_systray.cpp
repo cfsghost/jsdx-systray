@@ -275,6 +275,9 @@ namespace JSDXSystray {
 	{
 		HandleScope scope;
 
+		if (thread_running)
+			return  scope.Close(Boolean::New(False));
+
 		/* Get current display, screen and root window */
 		Display *disp = display = XOpenDisplay(NULL);
 		int screen = DefaultScreen(disp);
@@ -386,6 +389,36 @@ namespace JSDXSystray {
 		ev_ref(EV_DEFAULT_UC);
 
 		return scope.Close(Boolean::New(True));
+	}
+
+	static Handle<Value> X11ReleaseSelection(const Arguments& args)
+	{
+		HandleScope scope;
+		list<int>::iterator it;
+		Window w;
+		int screen = DefaultScreen(display);
+		Window root = DefaultRootWindow(display);
+
+		XSelectInput(display, trayWindow, NoEventMask);
+		thread_running = False;
+
+		for (it = trayClients.begin(); it != trayClients.end(); it++) {
+			w = *it;
+
+			/* Release systray icons */
+			XSelectInput(display, w, NoEventMask);
+			XUnmapWindow(display, w);
+			XReparentWindow(display, w, root, 0, 0);
+		}
+		XFlush(display);
+
+		/* Destroy tray window */
+		trayClients.clear();
+		XDestroyWindow(display, trayWindow);
+
+		ev_unref(EV_DEFAULT_UC);
+
+		return Undefined();
 	}
 
 	static Handle<Value> X11GetTrayClients(const Arguments& args)
@@ -552,6 +585,7 @@ namespace JSDXSystray {
 
 		NODE_SET_METHOD(target, "x11HasSelectionOwner", X11HasSelectionOwner);
 		NODE_SET_METHOD(target, "x11AcquireSelection", X11AcquireSelection);
+		NODE_SET_METHOD(target, "x11ReleaseSelection", X11ReleaseSelection);
 		NODE_SET_METHOD(target, "x11GetTrayClients", X11GetTrayClients);
 		NODE_SET_METHOD(target, "x11SendEvent", X11SendEvent);
 		NODE_SET_METHOD(target, "on", SetEventHandler);
