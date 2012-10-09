@@ -11,6 +11,7 @@
 #include "jsdx_systray.hpp"
 #include "ewmh.hpp"
 #include "xembed.hpp"
+#include "x11.hpp"
 
 #define SYSTEM_TRAY_REQUEST_DOCK    0
 #define SYSTEM_TRAY_BEGIN_MESSAGE   1
@@ -39,7 +40,8 @@ namespace JSDXSystray {
 
 	enum {
 		SYSTRAY_EVENT_BUTTON_PRESS,
-		SYSTRAY_EVENT_BUTTON_RELEASE
+		SYSTRAY_EVENT_BUTTON_RELEASE,
+		SYSTRAY_EVENT_MOTION
 	};
 
 	/* Event handlers */
@@ -61,10 +63,9 @@ namespace JSDXSystray {
 	Atom a_WM_TAKE_FOCUS;
 
 	/* Thread for X11 event dispatcher */
-	static pthread_t x11event_thread;
-	static ev_async eio_x11event_notifier;
-	pthread_mutex_t x11event_mutex = PTHREAD_MUTEX_INITIALIZER;
-	bool thread_running = False;
+	static uv_async_t uv_x11event_notifier;
+	static uv_check_t uv_x11event_checker;
+
 	Display *display;
 	XEvent x11event;
 
@@ -73,47 +74,15 @@ namespace JSDXSystray {
 	Window trayWindow;
 	list<int> trayClients;
 
-	static void *X11EventDispatcherThread(void *d)
+	static void X11EventChecker(uv_check_t* handle, int status)
 	{
-		Display *disp = (Display *)d;
-		int fd = ConnectionNumber(disp);
-		struct timeval tv;
-		fd_set in_fds;
-
-		thread_running = True;
-
-		while(thread_running) {
-
-			/* Create a File Description for X11 display */
-			FD_ZERO(&in_fds);
-			FD_SET(fd, &in_fds);
-
-			/* Set our timer */
-			tv.tv_usec = 0;
-			tv.tv_sec = 1;
-
-			/* Wait for X Event or a Timer */
-			if (select(fd + 1, &in_fds, 0, 0, &tv)) {
-
-				/* Call handler if there is events */
-				pthread_mutex_lock(&x11event_mutex);
-				if (XPending(disp)) {
-					ev_async_send(EV_DEFAULT_UC_ &eio_x11event_notifier);
-				}
-
-				pthread_mutex_unlock(&x11event_mutex);
-			}
-		}
+		if (XPending(display))
+			uv_async_send(&uv_x11event_notifier);
 	}
 
-	static void X11EventCallback(EV_P_ ev_async *watcher, int revents)
+	static void X11EventCallback(uv_async_t *handle, int status)
 	{
 		HandleScope scope;
-
-		assert(watcher == &eio_x11event_notifier);
-		assert(revents == EV_ASYNC);
-
-		pthread_mutex_lock(&x11event_mutex);
 
 		/* Handle all events */
 		while(XPending(display)) {
@@ -210,6 +179,7 @@ namespace JSDXSystray {
 								/* Call callback function */
 								add_client_cb->cb->Call(add_client_cb->Holder, 1, argv);
 							}
+
 							break;
 						}
 						case SYSTEM_TRAY_BEGIN_MESSAGE:
@@ -225,6 +195,7 @@ namespace JSDXSystray {
 					} else if (x11event.xclient.message_type == a_NET_SYSTEM_TRAY_MESSAGE_DATA) {
 						printf("_NET_SYSTEM_TRAY_MESSAGE_DATA\n");
 					} else if (x11event.xclient.message_type == a_WM_PROTOCOLS && x11event.xclient.data.l[0] == a_WM_TAKE_FOCUS) {
+						printf("WM_TAKE_FOCUS\n");
 						/* TODO: Take focus */
 					}
 				}
@@ -267,8 +238,6 @@ namespace JSDXSystray {
 				}
 			}
 		}
-
-		pthread_mutex_unlock(&x11event_mutex);
 	}
 
 	static Handle<Value> X11HasSelectionOwner(const Arguments& args)
@@ -294,9 +263,6 @@ namespace JSDXSystray {
 	static Handle<Value> X11AcquireSelection(const Arguments& args)
 	{
 		HandleScope scope;
-
-		if (thread_running)
-			return  scope.Close(Boolean::New(False));
 
 		/* Get current display, screen and root window */
 		Display *disp = display = XOpenDisplay(NULL);
@@ -346,8 +312,11 @@ namespace JSDXSystray {
 		a_WM_PROTOCOLS = XInternAtom(disp, "WM_PROTOCOLS", False);
 		a_WM_TAKE_FOCUS = XInternAtom(disp, "WM_TAKE_FOCUS", False);
 
-		/* Create thread */
-		pthread_create(&x11event_thread, NULL, X11EventDispatcherThread, (void *)disp);
+		/* Listen to X Server */
+		uv_check_init(uv_default_loop(), &uv_x11event_checker);
+		uv_check_start(&uv_x11event_checker, X11EventChecker);
+		uv_async_init(uv_default_loop(), &uv_x11event_notifier, X11EventCallback);
+
 #if 1
 		/* Create an invisible window to manage selection */
 		XSetWindowAttributes attrs;
@@ -420,11 +389,8 @@ namespace JSDXSystray {
 
 		/* Show */
 		XMapWindow(disp, trayWindow);
-		XLowerWindow(disp, trayWindow);
-
-		/* start background thread and event handler for callback */
-		ev_async_init(&eio_x11event_notifier, X11EventCallback);
-		ev_async_start(EV_DEFAULT_UC_ &eio_x11event_notifier);
+		//XLowerWindow(disp, trayWindow);
+		XRaiseWindow(disp, trayWindow);
 
 		/* Set the orientation */
 		unsigned long data = SYSTEM_TRAY_ORIENTATION_HORZ;
@@ -458,9 +424,6 @@ namespace JSDXSystray {
 		xev.data.l[4] = 0;
 		XSendEvent(disp, root, False, StructureNotifyMask, (XEvent *) &xev);
 
-
-		ev_ref(EV_DEFAULT_UC);
-
 		return scope.Close(Boolean::New(True));
 	}
 
@@ -473,7 +436,6 @@ namespace JSDXSystray {
 		Window root = DefaultRootWindow(display);
 
 		XSelectInput(display, trayWindow, NoEventMask);
-		thread_running = False;
 
 		for (it = trayClients.begin(); it != trayClients.end(); it++) {
 			w = *it;
@@ -489,7 +451,8 @@ namespace JSDXSystray {
 		trayClients.clear();
 		XDestroyWindow(display, trayWindow);
 
-		ev_unref(EV_DEFAULT_UC);
+		uv_check_stop((uv_check_t *)&uv_x11event_checker);
+		uv_close((uv_handle_t *)&uv_x11event_checker, NULL);
 
 		return Undefined();
 	}
@@ -595,7 +558,30 @@ namespace JSDXSystray {
 			Window w = args[0]->ToNumber()->Value();
 			int eventType = args[1]->ToInteger()->Value();
 
-			if (eventType == SYSTRAY_EVENT_BUTTON_PRESS || eventType == SYSTRAY_EVENT_BUTTON_RELEASE) {
+			if (eventType == SYSTRAY_EVENT_MOTION) {
+
+				XMotionEvent xme;
+				xme.display = display;
+				xme.time = CurrentTime;
+				xme.same_screen = True;
+				xme.type = MotionNotify;
+				xme.x = args[2]->ToObject()->Get(String::NewSymbol("x"))->ToInteger()->Value();
+				xme.y = args[2]->ToObject()->Get(String::NewSymbol("y"))->ToInteger()->Value();
+
+				/* Getting top of window */
+				xme.subwindow = args[0]->ToNumber()->Value();
+				while(xme.subwindow) {
+					xme.window = xme.subwindow;
+
+					XQueryPointer(display, xme.window, &xme.root, &xme.subwindow, &xme.x_root, &xme.y_root, &xme.x, &xme.y, &xme.state);
+				}
+
+				XSendEvent(display, xme.window, True, PointerMotionMask, (XEvent *) &xme);
+				XFlush(display);
+
+
+			} else if (eventType == SYSTRAY_EVENT_BUTTON_PRESS || eventType == SYSTRAY_EVENT_BUTTON_RELEASE) {
+
 				XButtonEvent xev;
 
 				xev.display = display;
@@ -607,25 +593,29 @@ namespace JSDXSystray {
 				xev.y = args[2]->ToObject()->Get(String::NewSymbol("y"))->ToInteger()->Value();
 
 				/* Getting top of window */
-				xev.subwindow = args[0]->ToNumber()->Value();
+				xev.subwindow = w;
 				while(xev.subwindow) {
 					xev.window = xev.subwindow;
 
 					XQueryPointer(display, xev.window, &xev.root, &xev.subwindow, &xev.x_root, &xev.y_root, &xev.x, &xev.y, &xev.state);
 				}
 
+//				XEMBED::setFocusIn(display, trayWindow);
+//				XEMBED::setWindowActivate(display, trayWindow);
+
 #if 0
 			/* Set focus on window */
 			int screen = DefaultScreen(display);
-			Window root = DefaultRootWindow(display);
 
-			EWMH::sendClientMsg32(display, root, xev.window, a_NET_ACTIVE_WINDOW, 1, CurrentTime, 0, 0, 0);
+			EWMH::sendClientMsg32(display, root, trayWindow, a_NET_ACTIVE_WINDOW, 1, CurrentTime, 0, 0, 0);
+			EWMH::sendClientMsg32(display, root, trayWindow, a_WM_PROTOCOLS, a_WM_TAKE_FOCUS, 0, 0, 0, 0);
 //			EWMH::sendClientMsg32(display, root, trayWindow, a_WM_PROTOCOLS, a_WM_TAKE_FOCUS, 0, 0, 0, 0);
-/*
+
 			XChangeProperty(display, trayWindow,
 				a_NET_ACTIVE_WINDOW, XA_WINDOW, 32, PropModeReplace,
-				(unsigned char *)&xev.window, 1);
-*/
+				(unsigned char *)&trayWindow, 1);
+
+//			XSetInputFocus(display, w, RevertToPointerRoot, CurrentTime);
 			XFlush(display);
 #endif
 
@@ -645,7 +635,15 @@ namespace JSDXSystray {
 					xev.button = Button3;
 				}
 
-				XSendEvent(display, xev.window, True, SubstructureNotifyMask | ButtonPressMask, (XEvent *) &xev);
+				if (eventType == SYSTRAY_EVENT_BUTTON_PRESS) {
+					XSendEvent(display, w, True, ButtonPressMask, (XEvent *) &xev);
+				} else {
+					XSendEvent(display, w, True, ButtonReleaseMask, (XEvent *) &xev);
+				}
+				XFlush(display);
+
+				Window root = DefaultRootWindow(display);
+				X11::setActive(display, w, root, True);
 				XFlush(display);
 			}
 		}

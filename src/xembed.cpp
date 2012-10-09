@@ -4,6 +4,7 @@
 
 #include "ewmh.hpp"
 #include "xembed.hpp"
+#include "x11.hpp"
 
 namespace JSDXSystray {
 
@@ -85,6 +86,7 @@ namespace JSDXSystray {
 	bool XEMBED::eventHandler(XEvent *xev)
 	{
 		Atom a_XEMBED = XInternAtom(xev->xclient.display, "_XEMBED", False);
+		Window root = DefaultRootWindow(xev->xclient.display);
 
 		if (xev->xclient.message_type == a_XEMBED) {
 			switch(xev->xclient.data.l[1]) {
@@ -99,6 +101,8 @@ namespace JSDXSystray {
 			case XEMBED_MODALITY_OFF:
 			case XEMBED_FOCUS_IN:
 				printf("XEMBED_FOCUS_IN\n");
+
+				X11::setActive(xev->xclient.display, xev->xclient.window, root, True);
 				break;
 			case XEMBED_FOCUS_OUT:
 				printf("XEMBED_FOCUS_OUT\n");
@@ -155,6 +159,9 @@ namespace JSDXSystray {
 
 			return False;
 		}
+
+		if (!xev->xproperty.send_event)
+			XSendEvent(xev->xproperty.display, xev->xproperty.window, True, PropertyChangeMask, (XEvent *) xev);
 
 		return True;
 	}

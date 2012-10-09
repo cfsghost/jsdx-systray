@@ -1,6 +1,6 @@
 {
 	"name": "jsdx-systray",
-	"version": "0.0.1",
+	"version": "0.0.2",
 	"description": "Systray API on JSDX framework",
 	"keywords": [
 		"jsdx",
@@ -11,7 +11,7 @@
 	"author": {
 		"name": "Fred Chien(錢逢祥)",
 		"email": "cfsghost@gmail.com",
-		"web": "http://people.linux.org.tw/~fred/"
+		"web": "http://fred-zone.blogspot.com/"
 	},
 	"license": "MIT",
 	"repository": {
@@ -22,10 +22,10 @@
 		"tests": "tests"
 	},
 	"engines": {
-		"node": ">= 0.4.0"
+		"node": ">= 0.6.0"
 	},
 	"scripts": {
-		"install": "node-waf configure build"
+		"install": "node-gyp configure build"
 	},
 	"main": "./lib/jsdx_systray.js"
 }
