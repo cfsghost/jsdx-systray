@@ -87,6 +87,8 @@ namespace JSDXSystray {
 		/* Handle all events */
 		while(XPending(display)) {
 
+			XNextEvent(display, &x11event);
+
 			if (x11event.type == DestroyNotify) {
 				XDestroyWindowEvent *xewe = (XDestroyWindowEvent *)&x11event;
 
@@ -236,8 +238,6 @@ namespace JSDXSystray {
 					}
 				}
 			}
-
-			XNextEvent(display, &x11event);
 		}
 	}
 
